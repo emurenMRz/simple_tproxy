@@ -1,5 +1,6 @@
 require 'socket'
 require 'fileutils'
+require 'zlib'
 
 class SimpleTProxy
 	#
@@ -141,6 +142,7 @@ class SimpleTProxy
 
 		# == Limit Content-Type
 		type = respose[:header]['Content-Type']
+		return false if type.nil?
 		return false if type != 'binary/octet-stream' and type[0, 12] != 'application/' and type[0, 6] != 'image/'
 
 		return true
@@ -152,23 +154,31 @@ class SimpleTProxy
 	def self.output_response_body(request, response)
 		return unless output_response_body?(request, response)
 
-		host = request[:host]
-		path = request[:path]
 		body = response[:body]
 		body.rewind
 		return if body.nil? or body.length == 0
 
 		Thread.new {
 			begin
+				host = request[:host]
+				path = request[:path]
+
 				path.sub!(/^.+:\/\/.+?\//, '')
 				path = path[1, path.length] if path[0] == '/'
 				pos = path.index('?')
 				path = path[0, pos] unless pos.nil?
 				fpath = "#{host}/#{path}"
 
-				puts "Output file: #{fpath}"
 				FileUtils.mkdir_p(File.dirname(fpath))
-				IO.copy_stream(body, open(fpath, 'wb'))
+				open(fpath, 'wb') {|ofile|
+					content_encoding = response[:header]['Content-Encoding']
+					if content_encoding == 'gzip' then
+						ofile.syswrite(Zlib::Inflate.new(Zlib::MAX_WBITS + 32).inflate(body.string))
+					else
+						IO.copy_stream(body, ofile)
+					end
+				}
+				puts "Output: #{fpath}"
 			rescue => e
 				puts e.full_message
 			end
