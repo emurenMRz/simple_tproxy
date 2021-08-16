@@ -10,9 +10,11 @@ class SimpleTProxy
 		loop do
 			line = sock.gets
 			break if line.length <= 2
-			item = line.split(':')
-			break if item.length == 1
-			header[item[0]] = item[1].strip!
+			pos = line.index(':')
+			break if pos.nil?
+			name = line[0, pos]
+			value = line[(pos + 1) .. -1].strip!
+			header[name] = value
 		end
 		return header
 	end
@@ -187,9 +189,7 @@ class SimpleTProxy
 					request = receive_http_request(s_sock)
 					d_sock = send_http_request(request)
 
-					# IO.copy_stream(d_sock, s_sock)
 					response = forward_http_response(d_sock, s_sock)
-
 					output_response_body(request, response)
 				rescue => e
 					puts e.full_message
