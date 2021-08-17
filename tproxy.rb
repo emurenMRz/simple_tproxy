@@ -1,8 +1,11 @@
 require 'socket'
 require 'fileutils'
 require 'zlib'
+require 'logger'
 
 class SimpleTProxy
+	@@log = Logger.new(STDOUT)
+
 	#
 	# Parse the Request/Response header.
 	#
@@ -23,12 +26,12 @@ class SimpleTProxy
 	#
 	# Receive HTTP request from the client side.
 	#
-	def self.receive_http_request(sock)
+	def self.receive_http_request(from, sock)
 		method, path, http_version = sock.gets.strip!.split
-		puts "#{method} #{path} #{http_version}"
+		@@log.debug("#{from} >> #{method} #{path} #{http_version}")
 
 		header = parse_header(sock)
-		pp header
+		@@log.debug("#{from} >> " + header.to_s)
 
 		raise "Unsupport HTTP version: #{http_version}" unless http_version.match(/HTTP\/1\.[01]/)
 
@@ -39,7 +42,7 @@ class SimpleTProxy
 		body = ''
 		if content_length > 0 then
 			sock.read(content_length, body)
-			puts body
+			@@log.debug("#{from} >> " + body)
 		end
 
 		return {
@@ -70,18 +73,18 @@ class SimpleTProxy
 	#
 	# Forwarding and parsing HTTP responses.
 	#
-	def self.forward_http_response(d_sock, s_sock)
+	def self.forward_http_response(connect, d_sock, s_sock)
 		signature = ''
 		d_sock.read(4, signature)
 		raise "Not HTTP: #{signature}" if signature != 'HTTP'
 
 		res = d_sock.gets
 		http_version, status_code, reason = res.strip!.split
-		puts "#{signature}#{http_version} #{status_code} #{reason}"
+		@@log.debug("#{connect} >> #{signature}#{http_version} #{status_code} #{reason}")
 		raise "Unsupport HTTP version: #{http_version}" if http_version != "/1.1"
 
 		header = parse_header(d_sock)
-		pp header
+		@@log.debug("#{connect} >> " + header.to_s)
 		header.each {|k, v| res += "#{k}: #{v}\r\n"}
 		res += "\r\n"
 		s_sock.write(signature + res)
@@ -92,7 +95,7 @@ class SimpleTProxy
 			copied_bytes = IO.copy_stream(d_sock, data, content_length)
 			data.rewind
 			copied_bytes = IO.copy_stream(data, s_sock, copied_bytes)
-			puts "Transferred body size: #{copied_bytes} bytes"
+			@@log.debug("#{connect} >> Transferred body size: #{copied_bytes} bytes")
 		else
 			transfer_encoding = header["Transfer-Encoding"]
 			if transfer_encoding == 'chunked' then
@@ -107,7 +110,7 @@ class SimpleTProxy
 					copied_bytes = IO.copy_stream(d_sock, chunk, len)
 					chunk.rewind
 					copied_bytes = IO.copy_stream(chunk, s_sock, copied_bytes)
-					puts "Transferred chunk size: #{copied_bytes} bytes"
+					@@log.debug("#{connect} >> Transferred chunk size: #{copied_bytes} bytes")
 
 					s_sock.write(d_sock.gets)
 					s_sock.flush
@@ -124,6 +127,7 @@ class SimpleTProxy
 		end
 
 		return {
+			:http_version => "#{signature}#{http_version}",
 			:status_code => status_code,
 			:reason => reason,
 			:header => header,
@@ -151,7 +155,7 @@ class SimpleTProxy
 	#
 	# Output the response body to a file.
 	#
-	def self.output_response_body(request, response)
+	def self.output_response_body(connect, request, response)
 		return unless output_response_body?(request, response)
 
 		body = response[:body]
@@ -178,9 +182,9 @@ class SimpleTProxy
 						IO.copy_stream(body, ofile)
 					end
 				}
-				puts "Output: #{fpath}"
+				@@log.info("#{connect} >> Output: #{fpath}")
 			rescue => e
-				puts e.full_message
+				@@log.error("#{connect} >>\n" + e.full_message)
 			end
 		}
 	end
@@ -188,21 +192,27 @@ class SimpleTProxy
 	#
 	# Starting proxy server
 	#
-	def self.start(ipaddr = nil, port = 8081)
+	def self.start(ipaddr = nil, port = 8081, log_name: nil, log_level: Logger::Severity::INFO)
+		@@log = Logger.new(log_name, 'daily') unless log_name.nil?
+		@@log.progname = 'tproxy'
+		@@log.level = log_level
 		Socket.tcp_server_loop(ipaddr, port) {|s_sock, client_addrinfo|
 			Thread.new {
 				d_sock = nil
+				from = client_addrinfo.inspect_sockaddr
+				to = nil
 				begin
-					puts "======================================"
-					pp client_addrinfo
-
-					request = receive_http_request(s_sock)
+					request = receive_http_request(from, s_sock)
+					to = request[:host]
 					d_sock = send_http_request(request)
 
-					response = forward_http_response(d_sock, s_sock)
-					output_response_body(request, response)
+					conn = "#{from} => #{to}"
+					response = forward_http_response(conn, d_sock, s_sock)
+					output_response_body(conn, request, response)
+
+					@@log.info("#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]} => #{response[:http_version]} #{response[:status_code]} #{response[:reason]}")
 				rescue => e
-					puts e.full_message
+					@@log.error("#{from} => #{to} >>\n" + e.full_message)
 				ensure
 					s_sock.close
 					d_sock.close unless d_sock.nil?
