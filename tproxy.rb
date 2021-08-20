@@ -24,9 +24,67 @@ class SimpleTProxy
 	end
 
 	#
-	# Receive HTTP request from the client side.
+	# Transfers the entity body.
+	# If an IO object is specified, it is also copied to the specified IO object.
 	#
-	def self.receive_http_request(from, sock)
+	def self.transfers_entity_body(conn, header, src, dst, out_io = nil)
+		content_length = header["Content-Length"].to_i
+		transferred_bytes = 0
+		if content_length > 0 then
+			if out_io.nil? then
+				transferred_bytes = IO.copy_stream(src, dst, content_length)
+			else
+				transferred_bytes = IO.copy_stream(src, out_io, content_length)
+				out_io.rewind
+				transferred_bytes = IO.copy_stream(out_io, dst, transferred_bytes)
+			end
+		else
+			transfer_encoding = header["Transfer-Encoding"]
+			if transfer_encoding == 'chunked' then
+				chunk = nil
+				chunk = StringIO.new unless out_io.nil?
+				loop do
+					len = src.gets
+					dst.write(len)
+					len = len.hex
+					break if len == 0
+
+					copied_bytes = 0
+					if chunk.nil? then
+						copied_bytes = IO.copy_stream(src, dst, len)
+					else
+						chunk.rewind
+						copied_bytes = IO.copy_stream(src, chunk, len)
+						chunk.rewind
+						copied_bytes = IO.copy_stream(chunk, dst, copied_bytes)
+					end
+					@@log.debug("#{conn} >> Transferred chunk size: #{copied_bytes} bytes")
+
+					dst.write(src.gets)
+					dst.flush
+
+					unless chunk.nil? then
+						chunk.rewind
+						IO.copy_stream(chunk, out_io, copied_bytes)
+					end
+					transferred_bytes += copied_bytes
+				end
+				dst.flush
+				dst.write(src.gets)
+				dst.flush
+			elsif transfer_encoding.nil? == false then
+				raise "Unknown Transfer-Encoding: #{transfer_encoding}"
+			end
+		end
+		out_io.rewind unless out_io.nil?
+		@@log.debug("#{conn} >> Transferred total size: #{transferred_bytes} bytes")
+		return transferred_bytes
+	end
+
+	#
+	# Receive HTTP request header from the client side.
+	#
+	def self.receive_request_header(from, sock)
 		method, path, http_version = sock.gets.strip!.split
 		@@log.debug("#{from} >> #{method} #{path} #{http_version}")
 
@@ -38,36 +96,39 @@ class SimpleTProxy
 		host = header["Host"]
 		raise "No Host header." if host.nil?
 
-		content_length = header["Content-Length"].to_i
-		body = ''
-		if content_length > 0 then
-			sock.read(content_length, body)
-			@@log.debug("#{from} >> " + body)
-		end
-
 		return {
 			:method => method,
 			:path => path,
 			:http_version => http_version,
 			:header => header,
-			:host => host,
-			:body => body
+			:host => host
 		}
 	end
 
 	#
-	# Send HTTP request to the server side.
+	# Send HTTP request header to the server side.
 	#
-	def self.send_http_request(request)
+	def self.send_request_header(request)
 		req = "#{request[:method]} #{request[:path]} #{request[:http_version]}\r\n"
 		request[:header].each {|k, v| req += "#{k}: #{v}\r\n"}
 		req += "\r\n"
 
 		sock = Socket.tcp(request[:host], 80)
 		sock.write(req)
-		sock.write(request[:body])
 		sock.flush
 		return sock
+	end
+
+	#
+	# Forwarding HTTP request.
+	#
+	def self.forward_http_request(from, s_sock)
+		request = receive_request_header(from, s_sock)
+		d_sock = send_request_header(request)
+		entity_body = StringIO.new
+		transfers_entity_body(from, request[:header], s_sock, d_sock, entity_body)
+		request[:body] = entity_body
+		return request, d_sock
 	end
 
 	#
@@ -78,60 +139,27 @@ class SimpleTProxy
 		d_sock.read(4, signature)
 		raise "Not HTTP: #{signature}" if signature != 'HTTP'
 
-		res = d_sock.gets
+		res = signature + d_sock.gets
 		http_version, status_code, reason = res.strip!.split
-		@@log.debug("#{connect} >> #{signature}#{http_version} #{status_code} #{reason}")
-		raise "Unsupport HTTP version: #{http_version}" if http_version != "/1.1"
+		@@log.debug("#{connect} >> #{http_version} #{status_code} #{reason}")
+		raise "Unsupport HTTP version: #{http_version}" if http_version != "HTTP/1.1"
 
 		header = parse_header(d_sock)
 		@@log.debug("#{connect} >> " + header.to_s)
 		header.each {|k, v| res += "#{k}: #{v}\r\n"}
 		res += "\r\n"
-		s_sock.write(signature + res)
+		s_sock.write(res)
+		s_sock.flush
 
-		content_length = header["Content-Length"].to_i
-		data = StringIO.new
-		if content_length > 0 then
-			copied_bytes = IO.copy_stream(d_sock, data, content_length)
-			data.rewind
-			copied_bytes = IO.copy_stream(data, s_sock, copied_bytes)
-			@@log.debug("#{connect} >> Transferred body size: #{copied_bytes} bytes")
-		else
-			transfer_encoding = header["Transfer-Encoding"]
-			if transfer_encoding == 'chunked' then
-				chunk = StringIO.new
-				loop do
-					len = d_sock.gets
-					s_sock.write(len)
-					len = len.hex
-					break if len == 0
-
-					chunk.rewind
-					copied_bytes = IO.copy_stream(d_sock, chunk, len)
-					chunk.rewind
-					copied_bytes = IO.copy_stream(chunk, s_sock, copied_bytes)
-					@@log.debug("#{connect} >> Transferred chunk size: #{copied_bytes} bytes")
-
-					s_sock.write(d_sock.gets)
-					s_sock.flush
-
-					chunk.rewind
-					IO.copy_stream(chunk, data, copied_bytes)
-				end
-				s_sock.flush
-				s_sock.write(d_sock.gets)
-				s_sock.flush
-			elsif transfer_encoding.nil? == false then
-				raise "Unknown Transfer-Encoding: #{transfer_encoding}"
-			end
-		end
+		entity_body = StringIO.new
+		transfers_entity_body(connect, header, d_sock, s_sock, entity_body)
 
 		return {
-			:http_version => "#{signature}#{http_version}",
+			:http_version => http_version,
 			:status_code => status_code,
 			:reason => reason,
 			:header => header,
-			:body => data
+			:body => entity_body
 		}
 	end
 
@@ -159,7 +187,6 @@ class SimpleTProxy
 		return unless output_response_body?(request, response)
 
 		body = response[:body]
-		body.rewind
 		return if body.nil? or body.length == 0
 
 		Thread.new {
@@ -202,12 +229,12 @@ class SimpleTProxy
 				from = client_addrinfo.inspect_sockaddr
 				to = nil
 				begin
-					request = receive_http_request(from, s_sock)
+					request, d_sock = forward_http_request(from, s_sock)
 					to = request[:host]
-					d_sock = send_http_request(request)
 
 					conn = "#{from} => #{to}"
 					response = forward_http_response(conn, d_sock, s_sock)
+
 					output_response_body(conn, request, response)
 
 					@@log.info("#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]} => #{response[:http_version]} #{response[:status_code]} #{response[:reason]}")
