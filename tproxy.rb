@@ -3,8 +3,37 @@ require 'fileutils'
 require 'zlib'
 require 'logger'
 
+class Connection
+	attr_reader :s_sock, :d_sock, :from, :to
+
+	def initialize(s_sock, client_addrinfo, &block)
+		@s_sock = s_sock
+		@d_sock = nil
+		@from = client_addrinfo.inspect_sockaddr
+		@to = nil
+		block.call(self) if block_given?
+	end
+
+	def open_host(host_name)
+		return if @to == host_name
+		@d_sock.close unless @d_sock.nil?
+		@d_sock = Socket.tcp(host_name, 80)
+		@to = host_name
+	end
+
+	def close
+		@s_sock.close unless @s_sock.nil?
+		@d_sock.close unless @d_sock.nil?
+	end
+
+	def to_s
+		"#{@from} => #{@to}"
+	end
+end
+
 class SimpleTProxy
 	@@log = Logger.new(STDOUT)
+	@@connections = {}
 
 	#
 	# Parse the Request/Response header.
@@ -85,7 +114,11 @@ class SimpleTProxy
 	# Receive HTTP request header from the client side.
 	#
 	def self.receive_request_header(from, sock)
-		method, path, http_version = sock.gets.strip!.split
+		return nil if sock.nil? or sock.eof?
+		recv_buf = sock.gets
+		raise "Unable to receive request header." if recv_buf.nil?
+
+		method, path, http_version = recv_buf.strip!.split
 		@@log.debug("#{from} >> #{method} #{path} #{http_version}")
 
 		header = parse_header(sock)
@@ -96,63 +129,75 @@ class SimpleTProxy
 		host = header["Host"]
 		raise "No Host header." if host.nil?
 
+		keep_alive = http_version == 'HTTP/1.1'
+		keep_alive = false if header['Connection'] == 'Close'
+		if keep_alive and header['Keep-Alive'].kind_of?(String) then
+			max = header['Keep-Alive'].match(/max=([0-9]+)/).to_a[1].to_i
+			keep_alive = false if max == 0
+		end
+
 		return {
 			:method => method,
 			:path => path,
 			:http_version => http_version,
 			:header => header,
-			:host => host
+			:host => host,
+			:keep_alive => keep_alive
 		}
 	end
 
 	#
 	# Send HTTP request header to the server side.
 	#
-	def self.send_request_header(request)
+	def self.send_request_header(request, sock)
 		req = "#{request[:method]} #{request[:path]} #{request[:http_version]}\r\n"
 		request[:header].each {|k, v| req += "#{k}: #{v}\r\n"}
 		req += "\r\n"
 
-		sock = Socket.tcp(request[:host], 80)
 		sock.write(req)
 		sock.flush
-		return sock
 	end
 
 	#
 	# Forwarding HTTP request.
 	#
-	def self.forward_http_request(from, s_sock)
-		request = receive_request_header(from, s_sock)
-		d_sock = send_request_header(request)
+	def self.forward_http_request(conn)
+		request = receive_request_header(conn.from, conn.s_sock)
+		return nil if request.nil?
+		
+		conn.open_host(request[:host])
+		send_request_header(request, conn.d_sock)
+
 		entity_body = StringIO.new
-		transfers_entity_body(from, request[:header], s_sock, d_sock, entity_body)
+		transfers_entity_body(conn.from, request[:header], conn.s_sock, conn.d_sock, entity_body)
 		request[:body] = entity_body
-		return request, d_sock
+		return request
 	end
 
 	#
 	# Forwarding and parsing HTTP responses.
 	#
-	def self.forward_http_response(connect, d_sock, s_sock)
+	def self.forward_http_response(conn)
+		raise "Disconnected from the remote host." if conn.d_sock.nil? or conn.d_sock.eof?
+
 		signature = ''
-		d_sock.read(4, signature)
+		conn.d_sock.read(4, signature)
 		raise "Not HTTP: #{signature}" if signature != 'HTTP'
 
-		res = signature + d_sock.gets
+		res = signature + conn.d_sock.gets
 		http_version, status_code, reason = res.strip!.split
-		@@log.debug("#{connect} >> #{http_version} #{status_code} #{reason}")
+		@@log.debug("#{conn} >> #{http_version} #{status_code} #{reason}")
 		raise "Unsupport HTTP version: #{http_version}" if http_version != "HTTP/1.1"
 
-		header = parse_header(d_sock)
-		@@log.debug("#{connect} >> " + header.to_s)
+		header = parse_header(conn.d_sock)
+		@@log.debug("#{conn} >> " + header.to_s)
 		header.each {|k, v| res += "#{k}: #{v}\r\n"}
 		res += "\r\n"
-		s_sock.write(res)
-		s_sock.flush
+		conn.s_sock.write(res)
+		conn.s_sock.flush
 
 		entity_body = StringIO.new
-		transfers_entity_body(connect, header, d_sock, s_sock, entity_body)
+		transfers_entity_body(conn, header, conn.d_sock, conn.s_sock, entity_body)
 
 		return {
 			:http_version => http_version,
@@ -223,28 +268,32 @@ class SimpleTProxy
 		@@log = Logger.new(log_name, 'daily') unless log_name.nil?
 		@@log.progname = 'tproxy'
 		@@log.level = log_level
-		Socket.tcp_server_loop(ipaddr, port) {|s_sock, client_addrinfo|
-			Thread.new {
-				d_sock = nil
-				from = client_addrinfo.inspect_sockaddr
-				to = nil
-				begin
-					request, d_sock = forward_http_request(from, s_sock)
-					to = request[:host]
+		Socket.tcp_server_loop(ipaddr, port) do |s_sock, client_addrinfo|
+			Thread.new do
+				Connection.new(s_sock, client_addrinfo) do |conn|
+					@@connections[client_addrinfo.inspect_sockaddr] = conn
+					begin
+						loop do
+							request = forward_http_request(conn)
+							break if request.nil?
+							
+							response = forward_http_response(conn)
+							output_response_body(conn, request, response)
 
-					conn = "#{from} => #{to}"
-					response = forward_http_response(conn, d_sock, s_sock)
+							@@log.info("#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]} => #{response[:http_version]} #{response[:status_code]} #{response[:reason]}")
 
-					output_response_body(conn, request, response)
-
-					@@log.info("#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]} => #{response[:http_version]} #{response[:status_code]} #{response[:reason]}")
-				rescue => e
-					@@log.error("#{from} => #{to} >>\n" + e.full_message)
-				ensure
-					s_sock.close
-					d_sock.close unless d_sock.nil?
+							break unless request[:keep_alive]
+							break if IO.select([conn.s_sock, conn.d_sock]).length == 0
+						end
+					rescue => e
+						@@log.error("#{conn} >>\n" + e.full_message)
+					ensure
+						conn.close
+					end
+					@@connections.delete(client_addrinfo.inspect_sockaddr)
+					@@log.info("#{conn} >> disconnection: #{@@connections.length} remains.")
 				end
-			}
-		}
+			end
+		end
 	end
 end
