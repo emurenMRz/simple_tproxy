@@ -1,4 +1,5 @@
 require 'socket'
+require 'uri'
 require 'fileutils'
 require 'zlib'
 require 'logger'
@@ -14,10 +15,10 @@ class Connection
 		block.call(self) if block_given?
 	end
 
-	def open_host(host_name)
+	def open_host(host_name, port = 80)
 		return if @to == host_name
 		@d_sock.close unless @d_sock.nil?
-		@d_sock = Socket.tcp(host_name, 80)
+		@d_sock = Socket.tcp(host_name, port)
 		@to = host_name
 	end
 
@@ -121,14 +122,25 @@ class SimpleTProxy
 		m = start_line.strip!.match(/^(?<method>[A-Z]+) (?<path>[^ ]+) (?<http_version>HTTP\/1\.[01])$/)
 		raise "Unsupported HTTP request start line: #{start_line}" if m.nil?
 		method = m[:method]
+		raise "Unsupported CONNECT method: #{start_line}" if method == 'CONNECT'
 		path = m[:path]
 		http_version = m[:http_version]
+		protocol = 'http'
+		host = nil
+		port = 80
+		if path[0] != '/' then
+			uri = URI.parse(path)
+			protocol = uri.scheme
+			host = uri.host
+			port = uri.port
+			path = uri.path
+		end
 		@@log.debug("#{from} >> #{method} #{path} #{http_version}")
 
 		header = parse_header(sock)
 		@@log.debug("#{from} >> " + header.to_s)
 
-		host = header["Host"]
+		host = header["Host"] if host.nil?
 		raise "No Host header." if host.nil?
 
 		keep_alive = http_version == 'HTTP/1.1'
@@ -144,7 +156,9 @@ class SimpleTProxy
 			:http_version => http_version,
 			:header => header,
 			:host => host,
-			:keep_alive => keep_alive
+			:keep_alive => keep_alive,
+			:protocol => protocol,
+			:port => port
 		}
 	end
 
@@ -167,7 +181,7 @@ class SimpleTProxy
 		request = receive_request_header(conn.from, conn.s_sock)
 		return nil if request.nil?
 		
-		conn.open_host(request[:host])
+		conn.open_host(request[:host], request[:port])
 		send_request_header(request, conn.d_sock)
 
 		entity_body = StringIO.new
