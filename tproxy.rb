@@ -115,16 +115,18 @@ class SimpleTProxy
 	#
 	def self.receive_request_header(from, sock)
 		return nil if sock.nil? or sock.eof?
-		recv_buf = sock.gets
-		raise "Unable to receive request header." if recv_buf.nil?
+		start_line = sock.gets
+		raise "Unable to receive request header." if start_line.nil?
 
-		method, path, http_version = recv_buf.strip!.split
+		m = start_line.strip!.match(/^(?<method>[A-Z]+) (?<path>[^ ]+) (?<http_version>HTTP\/1\.[01])$/)
+		raise "Unsupported HTTP request start line: #{start_line}" if m.nil?
+		method = m[:method]
+		path = m[:path]
+		http_version = m[:http_version]
 		@@log.debug("#{from} >> #{method} #{path} #{http_version}")
 
 		header = parse_header(sock)
 		@@log.debug("#{from} >> " + header.to_s)
-
-		raise "Unsupport HTTP version: #{http_version}" unless http_version.match(/HTTP\/1\.[01]/)
 
 		host = header["Host"]
 		raise "No Host header." if host.nil?
@@ -179,18 +181,20 @@ class SimpleTProxy
 	#
 	def self.forward_http_response(conn)
 		raise "Disconnected from the remote host." if conn.d_sock.nil? or conn.d_sock.eof?
+		start_line = conn.d_sock.gets
+		raise "Unable to receive response header." if start_line.nil?
 
-		signature = ''
-		conn.d_sock.read(4, signature)
-		raise "Not HTTP: #{signature}" if signature != 'HTTP'
-
-		res = signature + conn.d_sock.gets
-		http_version, status_code, reason = res.strip!.split
+		m = start_line.strip!.match(/^(?<http_version>HTTP\/1\.[01]) (?<status_code>[0-9]{3}) (?<reason>.+)$/)
+		raise "Unsupported HTTP response start line: #{start_line}" if m.nil?
+		http_version = m[:http_version]
+		status_code = m[:status_code]
+		reason = m[:reason]
 		@@log.debug("#{conn} >> #{http_version} #{status_code} #{reason}")
-		raise "Unsupport HTTP version: #{http_version}" if http_version != "HTTP/1.1"
 
 		header = parse_header(conn.d_sock)
 		@@log.debug("#{conn} >> " + header.to_s)
+
+		res = start_line + "\r\n"
 		header.each {|k, v| res += "#{k}: #{v}\r\n"}
 		res += "\r\n"
 		conn.s_sock.write(res)
