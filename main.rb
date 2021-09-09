@@ -15,7 +15,7 @@ begin
 	)
 
 	Signal.trap(:INT) { proxy.stop; puts 'The server is stopped by an interrupt.'; exit }
-	Signal.trap(:TERM) { proxy.stop; puts 'The server is killed'; exit }
+	Signal.trap(:TERM) { proxy.stop; exit }
 	proxy.start
 rescue => e
 	puts e.full_message
