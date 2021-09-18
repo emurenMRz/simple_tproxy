@@ -18,12 +18,14 @@ class SimpleTProxy
 		bind_address: nil,
 		http_port:    8080,
 		https_port:   8443,
-		logger:       Logger.new(STDOUT)
+		logger:       Logger.new(STDOUT),
+		content_handler: nil
 	)
 		@bind_address = bind_address
 		@http_port    = http_port
 		@https_port   = https_port
 		@logger       = logger
+		@content_handler = content_handler.nil? ? method(:default_content_handler) : content_handler
 
 		@http_sock    = nil
 		@https_sock   = nil
@@ -244,55 +246,40 @@ class SimpleTProxy
 	end
 
 	#
-	# Output the response body ?
-	# 
-	def output_response_body?(request, respose)
-		# == Example: Limit hosts
-		# host = request[:host]
-		# return false if host != 'example.com'
-
-		# == Limit Content-Type
-		type = respose[:header]['Content-Type']
-		return false if type.nil?
-		return false if type != 'binary/octet-stream' and type[0, 12] != 'application/' and type[0, 6] != 'image/'
-
-		return true
-	end
-
-	#
 	# Output the response body to a file.
 	#
-	def output_response_body(connect, request, response)
-		return unless output_response_body?(request, response)
+	def default_content_handler(connect, request, response)
+		type = respose[:header]['Content-Type']
+		return if type.nil?
+		return if type != 'binary/octet-stream' and type[0, 12] != 'application/' and type[0, 6] != 'image/'
 
 		body = response[:body]
 		return if body.nil? or body.length == 0
 
-		Thread.new {
+		Thread.new do
 			begin
 				host = request[:host]
+				port = request[:port]
 				path = request[:path]
 
-				path.sub!(/^.+:\/\/.+?\//, '')
-				path = path[1, path.length] if path[0] == '/'
 				pos = path.index('?')
 				path = path[0, pos] unless pos.nil?
-				fpath = "#{host}/#{path}"
+				fpath = "#{host}/#{port}/#{path}"
 
 				FileUtils.mkdir_p(File.dirname(fpath))
-				open(fpath, 'wb') {|ofile|
+				open(fpath, 'wb') do |ofile|
 					content_encoding = response[:header]['Content-Encoding']
 					if content_encoding == 'gzip' then
 						ofile.syswrite(Zlib::Inflate.new(Zlib::MAX_WBITS + 32).inflate(body.string))
 					else
 						IO.copy_stream(body, ofile)
 					end
-				}
+				end
 				@logger.info("#{connect} >> Output: #{fpath}")
 			rescue => e
 				@logger.error("#{connect} >>\n" + e.full_message)
 			end
-		}
+		end
 	end
 
 	#
@@ -306,7 +293,7 @@ class SimpleTProxy
 			response = proxy_response_to_CONNECT(conn)
 		else
 			response = forward_http_response(conn)
-			output_response_body(conn, request, response)
+			@content_handler.call(conn, request, response)
 		end
 
 		@logger.info("#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]} => #{response[:http_version]} #{response[:status_code]} #{response[:reason]}")
@@ -355,16 +342,19 @@ class SimpleTProxy
 		def to_s; [@content_type].pack('C') + @version + @length + @payload; end
 	end
 
+	class TLSError < StandardError
+	end
+
 	#
 	# Get hostname from SNI
 	#
 	def open_host_by_SNI(conn)
 		packet = TLSPacket.new(conn.s_sock)
-		raise "Content Type is not Handshake: #{packet.inspect}" if packet.content_type_n != 22
+		raise TLSError.new("Content Type is not Handshake: #{packet.inspect}") if packet.content_type_n != 22
 
 		payload = StringIO.new(packet.payload)
 		handshake_type = payload.readbyte.to_i
-		raise "Handshake Type is not Client Hello: #{handshake_type}" if handshake_type != HandshakeType::ClientHello
+		raise TLSError.new("Handshake Type is not Client Hello: #{handshake_type}") if handshake_type != HandshakeType::ClientHello
 
 		length = payload.read(3)
 		version = payload.read(2)
@@ -393,7 +383,7 @@ class SimpleTProxy
 				payload.read(extension_length)
 			end
 		end
-		raise "The remote host name cannot be identified by the TLS handshake." if conn.d_sock.nil?
+		raise TLSError.new("The remote host name cannot be identified by the TLS handshake.") if conn.d_sock.nil?
 	end
 
 	#
@@ -412,7 +402,7 @@ class SimpleTProxy
 			elsif s == conn.d_sock
 				forward_tls_packet(conn, conn.d_sock, conn.s_sock)
 			else
-				raise "Unknown socket: #{s.addr} <=> #{s.peeraddr}"
+				raise TLSError.new("Unknown socket: #{s.addr} <=> #{s.peeraddr}")
 			end
 		end
 		return true
@@ -473,7 +463,7 @@ class SimpleTProxy
 						break unless keep_alive
 						break if IO.select([conn.s_sock, conn.d_sock]).length == 0
 					end
-				rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT => e
+				rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, TLSError => e
 					@logger.error("#{conn} >> #{e.message}")
 				rescue EOFError, Errno::ECONNRESET => e
 					@logger.error("#{conn} >> #{e.inspect} #{e.backtrace[0]}")
