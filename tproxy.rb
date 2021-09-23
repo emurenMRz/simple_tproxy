@@ -249,7 +249,7 @@ class SimpleTProxy
 	# Output the response body to a file.
 	#
 	def default_content_handler(connect, request, response)
-		type = respose[:header]['Content-Type']
+		type = response[:header]['Content-Type']
 		return if type.nil?
 		return if type != 'binary/octet-stream' and type[0, 12] != 'application/' and type[0, 6] != 'image/'
 
