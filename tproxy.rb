@@ -19,13 +19,15 @@ class SimpleTProxy
 		http_port:    8080,
 		https_port:   8443,
 		logger:       Logger.new(STDOUT),
-		content_handler: nil
+		content_handler: nil,
+		is_snooping_body_handler: nil
 	)
 		@bind_address = bind_address
 		@http_port    = http_port
 		@https_port   = https_port
 		@logger       = logger
-		@content_handler = content_handler.nil? ? method(:default_content_handler) : content_handler
+		@content_handler = content_handler.class == Proc ? content_handler : method(:default_content_handler)
+		@is_snooping_body_handler = is_snooping_body_handler.class == Proc ? is_snooping_body_handler : method(:default_snooping_body?)
 
 		@http_sock    = nil
 		@https_sock   = nil
@@ -185,7 +187,9 @@ class SimpleTProxy
 		if request[:method] != 'CONNECT' then
 			send_request_header(request, conn.d_sock)
 
-			entity_body = StringIO.new
+			conn.snooping_body = @is_snooping_body_handler.call(request)
+
+			entity_body = conn.snooping_body ? StringIO.new : nil
 			transfers_entity_body(conn.from, request[:header], conn.s_sock, conn.d_sock, entity_body)
 			request[:body] = entity_body
 		end
@@ -216,7 +220,7 @@ class SimpleTProxy
 		conn.s_sock.write(res)
 		conn.s_sock.flush
 
-		entity_body = StringIO.new
+		entity_body = conn.snooping_body ? StringIO.new : nil
 		transfers_entity_body(conn, header, conn.d_sock, conn.s_sock, entity_body)
 
 		return {
@@ -246,7 +250,20 @@ class SimpleTProxy
 	end
 
 	#
+	# When returning true, snooping the body of the request/response.
+	# If you want content_handler to handle content_body, return true here.
+	# *This is a sample of `is_snooping_body_handler`.*
+	#
+	def default_snooping_body?(request)
+		# For example, if you want to get the content_body only when the host is www.example.com:
+		# return request[:host] == 'www.example.com'
+		return true
+	end
+
+	#
 	# Output the response body to a file.
+	# If you want to handle content_body, is_snooping_body_handler must return true.
+	# *This is a sample of `content_hander`.*
 	#
 	def default_content_handler(connect, request, response)
 		type = response[:header]['Content-Type']
@@ -424,6 +441,7 @@ class SimpleTProxy
 	class Connection
 		attr_reader :s_sock, :d_sock, :from, :to
 		attr_writer :protocol_handler
+		attr_accessor :snooping_body
 	
 		def initialize(s_sock, protocol_handler, &block)
 			@s_sock = s_sock
@@ -431,6 +449,7 @@ class SimpleTProxy
 			@from = "#{s_sock.peeraddr[2]}:#{s_sock.peeraddr[1]}"
 			@to = "*No connect*"
 			@protocol_handler = protocol_handler
+			@snooping_body = false
 			block.call(self) if block_given?
 		end
 	
