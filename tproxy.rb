@@ -424,7 +424,7 @@ class SimpleTProxy
 			open_host_by_SNI(conn)
 		end
 
-		xsock = IO.select([conn.s_sock, conn.d_sock])
+		xsock = IO.select([conn.s_sock, conn.d_sock], [], [], 300)
 		return false if xsock.nil? or xsock.length == 0
 		for s in xsock[0]
 			if s == conn.s_sock
@@ -498,7 +498,7 @@ class SimpleTProxy
 					loop do
 						keep_alive = conn.session
 						break unless keep_alive
-						break if IO.select([conn.s_sock, conn.d_sock]).length == 0
+						break if IO.select([conn.s_sock, conn.d_sock], [], [], 300).length == 0
 					end
 				rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, TLSError => e
 					@logger.error("#{conn} >> #{e.message}")
