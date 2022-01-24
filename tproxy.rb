@@ -35,6 +35,19 @@ class SimpleTProxy
 	end
 	
 	#
+	# Show connection status.
+	#
+	def connection_list()
+		begin
+			now = Time.now
+			@connections.each {|k, v| puts "#{v}: #{now - v.update_time}(#{v.update_time})"}
+			puts "#{@connections.length} remains."
+		rescue => e
+			puts e.full_message
+		end
+	end
+	
+	#
 	# Parse the Request/Response header.
 	#
 	def parse_header(sock)
@@ -439,7 +452,7 @@ class SimpleTProxy
 	# Connection class
 	#
 	class Connection
-		attr_reader :s_sock, :d_sock, :from, :to
+		attr_reader :s_sock, :d_sock, :from, :to, :update_time
 		attr_writer :protocol_handler
 		attr_accessor :snooping_body
 	
@@ -450,6 +463,7 @@ class SimpleTProxy
 			@to = "*No connect*"
 			@protocol_handler = protocol_handler
 			@snooping_body = false
+			@update_time = Time.now
 			block.call(self) if block_given?
 		end
 	
@@ -465,7 +479,11 @@ class SimpleTProxy
 			@d_sock.close unless @d_sock.nil?
 		end
 	
-		def session; @protocol_handler.call(self); end
+		def session
+			@protocol_handler.call(self)
+			@update_time = Time.now
+		end
+
 		def to_s; "#{@from} => #{@to}"; end
 	end
 	
