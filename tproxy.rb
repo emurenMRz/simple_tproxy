@@ -479,11 +479,7 @@ class SimpleTProxy
 			@d_sock.close unless @d_sock.nil?
 		end
 	
-		def session
-			@protocol_handler.call(self)
-			@update_time = Time.now
-		end
-
+		def session; @protocol_handler.call(self); end
 		def to_s; "#{@from} => #{@to}"; end
 	end
 	
