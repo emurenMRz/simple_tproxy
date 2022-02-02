@@ -18,6 +18,7 @@ class SimpleTProxy
 		bind_address: nil,
 		http_port:    8080,
 		https_port:   8443,
+		command_port: 0,
 		logger:       Logger.new(STDOUT),
 		content_handler: nil,
 		is_snooping_body_handler: nil
@@ -25,26 +26,16 @@ class SimpleTProxy
 		@bind_address = bind_address
 		@http_port    = http_port
 		@https_port   = https_port
+		@command_port = command_port
 		@logger       = logger
 		@content_handler = content_handler.class == Proc ? content_handler : method(:default_content_handler)
 		@is_snooping_body_handler = is_snooping_body_handler.class == Proc ? is_snooping_body_handler : method(:default_snooping_body?)
 
 		@http_sock    = nil
 		@https_sock   = nil
+		@command_sock  = nil
 		@connections  = {}
-	end
-	
-	#
-	# Show connection status.
-	#
-	def connection_list()
-		begin
-			now = Time.now
-			@connections.each {|k, v| puts "#{v}: #{now - v.update_time}(#{v.update_time})"}
-			puts "#{@connections.length} remains."
-		rescue => e
-			puts e.full_message
-		end
+		@mutex        = Mutex.new
 	end
 	
 	#
@@ -449,6 +440,35 @@ class SimpleTProxy
 	end
 	
 	#
+	# Handling command sessions
+	#
+	def command_handler(s_sock)
+		Thread.new do
+			from = "#{s_sock.peeraddr[2]}:#{s_sock.peeraddr[1]}"
+			request = {}
+			begin
+				request = receive_request_header(from, s_sock)
+				raise 'failed parse.' if request.nil?
+				raise 'unsupport method.' unless request[:method] == 'GET'
+				raise 'unknown path.' unless request[:path] == '/status'
+
+				body = []
+				@mutex.synchronize {@connections.each {|k, v| body.push(v.status)}}
+
+				body_s = "[#{body.join(',')}]"
+				s_sock.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: #{body_s.length}\r\nConnection: close\r\n\r\n#{body_s}" )
+				@logger.info("#{from} >> #{request[:method]} #{request[:path]} #{request[:http_version]}: Success")
+			rescue => e
+				s_sock.write('HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n')
+				@logger.info("#{from} >> #{request[:method]} #{request[:path]} #{request[:http_version]}: #{e.full_message}")
+			ensure
+				s_sock.flush
+				s_sock.close
+			end
+		end
+	end
+
+	#
 	# Connection class
 	#
 	class Connection
@@ -461,6 +481,7 @@ class SimpleTProxy
 			@d_sock = nil
 			@from = "#{s_sock.peeraddr[2]}:#{s_sock.peeraddr[1]}"
 			@to = "*No connect*"
+			@close = true
 			@protocol_handler = protocol_handler
 			@snooping_body = false
 			@update_time = Time.now
@@ -472,15 +493,25 @@ class SimpleTProxy
 			@d_sock.close unless @d_sock.nil?
 			@to = "#{host_name}:#{port}"
 			@d_sock = Socket.tcp(host_name, port)
+			@close = false unless @d_sock.nil?
 		end
 	
 		def close
 			@s_sock.close unless @s_sock.nil?
 			@d_sock.close unless @d_sock.nil?
+			@close = true
 		end
 	
+		def alive?
+			return false if @close
+			dead = @s_sock.closed? || @d_sock.closed?
+			close if dead
+			return !dead
+		end
+
 		def session; @protocol_handler.call(self); end
 		def to_s; "#{@from} => #{@to}"; end
+		def status; '{"from":"' + @from + '","to":"' + @to + '","begin":' + @update_time.to_i.to_s + '}'; end
 	end
 	
 	#
@@ -489,7 +520,7 @@ class SimpleTProxy
 	def add_new_connection(sock, protocol_handler)
 		Thread.new do
 			Connection.new(sock, protocol_handler) do |conn|
-				@connections[conn.from] = conn
+				@mutex.synchronize {@connections[conn.from] = conn}
 				begin
 					loop do
 						keep_alive = conn.session
@@ -505,8 +536,10 @@ class SimpleTProxy
 				ensure
 					conn.close
 				end
-				@connections.delete(conn.from)
-				@logger.info("#{conn} >> disconnection: #{@connections.length} remains.")
+				@mutex.synchronize {
+					@connections.delete(conn.from)
+					@logger.info("#{conn} >> disconnection: #{@connections.length} remains.")
+				}
 			end
 		end
 	end
@@ -517,21 +550,33 @@ class SimpleTProxy
 	def start
 		@http_sock = TCPServer.open(@bind_address, @http_port) if @http_port > 0
 		@https_sock = TCPServer.open(@bind_address, @https_port) if @https_port > 0
+		@command_sock = TCPServer.open(@bind_address, @command_port) if @command_port > 0
 		ports = []
 		ports.push(@http_sock) unless @http_sock.nil?
 		ports.push(@https_sock) unless @https_sock.nil?
+		ports.push(@command_sock) unless @command_sock.nil?
 
 		accept_ports = 'HTTP: ' + (@http_sock.nil? ? 'No accept' : "#{@http_sock.addr[2]}:#{@http_sock.addr[1]}")
 		accept_ports += ', HTTPS: ' + (@https_sock.nil? ? 'No accept' : "#{@https_sock.addr[2]}:#{@https_sock.addr[1]}")
+		accept_ports += ', command: ' + (@command_sock.nil? ? 'No accept' : "#{@command_sock.addr[2]}:#{@command_sock.addr[1]}")
 		@logger.info(accept_ports)
 
 		begin
 			loop do
-				xsock = IO.select(ports)
-				next if xsock.nil?
+				xsock = IO.select(ports, [], [], 60)
+				if xsock.nil? then
+					@mutex.synchronize {
+						prev_conn = @connections.length
+						@connections.delete_if {|k, v| !v.alive?}
+						remain_conn = @connections.length
+						@logger.info("disconnection: #{prev_conn - remain_conn}(#{remain_conn} remains).") if prev_conn != remain_conn
+					}
+					next
+				end
 				for s in xsock[0]
 					if !@http_sock.nil? and s == @http_sock then add_new_connection(s.accept, method(:http_handler))
 					elsif !@https_sock.nil? and s == @https_sock then add_new_connection(s.accept, method(:https_handler))
+					elsif !@command_sock.nil? and s == @command_sock then command_handler(s.accept)
 					else raise "Unknown socket: #{s.addr}" end
 				end
 			end
@@ -548,7 +593,9 @@ class SimpleTProxy
 	def stop
 		@http_sock.close unless @http_sock.nil?
 		@https_sock.close unless @https_sock.nil?
+		@command_sock.close unless @command_sock.nil?
 		@http_sock = nil
 		@https_sock = nil
+		@command_sock = nil
 	end
 end

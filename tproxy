@@ -36,7 +36,6 @@ status()
 {
   if [ -e $PID ]; then
     echo "$NAME is running. PID:"`cat ${PID}`
-    kill -USR1 `cat ${PID}`
     exit 0
   fi
   echo "$NAME stopped."
