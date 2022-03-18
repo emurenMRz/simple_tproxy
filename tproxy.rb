@@ -3,6 +3,7 @@ require 'uri'
 require 'fileutils'
 require 'zlib'
 require 'logger'
+require 'stringio'
 
 module HandshakeType
 	ClientHello = 1
