@@ -13,32 +13,40 @@ module ExtensionType
 	ServerNameIndication = 0
 end
 
-
 class SimpleTProxy
-	def initialize(
-		bind_address: nil,
-		http_port:    8080,
-		https_port:   8443,
-		command_port: 0,
-		logger:       Logger.new(STDOUT),
-		content_handler: nil,
-		is_snooping_body_handler: nil
-	)
-		@bind_address = bind_address
-		@http_port    = http_port
-		@https_port   = https_port
-		@command_port = command_port
-		@logger       = logger
-		@content_handler = content_handler.class == Proc ? content_handler : method(:default_content_handler)
-		@is_snooping_body_handler = is_snooping_body_handler.class == Proc ? is_snooping_body_handler : method(:default_snooping_body?)
+	def initialize(logger: Logger.new(STDOUT))
+		@logger = logger
 
-		@http_sock    = nil
-		@https_sock   = nil
-		@command_sock  = nil
-		@connections  = {}
-		@mutex        = Mutex.new
+		@content_handler = []
+		@http_sock = nil
+		@https_sock = nil
+		@command_sock = nil
+		@connections = {}
+		@mutex = Mutex.new
 	end
-	
+
+	#
+	# request/response packets handler.
+	#
+	class ContentHandler
+		attr_reader :host, :path, :handler
+
+		def initialize(host, path, handler)
+			@host = host
+			@path = path
+			@handler = handler
+		end
+	end
+
+	def search_handler(host, path)
+		@content_handler.find {|r| (r.host.nil? && r.path.nil?) || ((r.host.nil? || host.nil?) ? false : host.match?(r.host)) || ((r.path.nil? || path.nil?) ? false : path.match?(r.path))}
+	end
+
+	def content_handler(host: nil, path: nil, &handler)
+		raise "Exists content_handler: #{host.nil? ? '' : host}#{path.nil? ? '' : path}" unless search_handler(host, path).nil?
+		@content_handler.append ContentHandler.new(host, path, handler).freeze
+	end
+
 	#
 	# Parse the Request/Response header.
 	#
@@ -53,7 +61,7 @@ class SimpleTProxy
 			value = line[(pos + 1) .. -1].strip!
 			header[name] = value
 		end
-		return header
+		header
 	end
 
 	#
@@ -63,66 +71,66 @@ class SimpleTProxy
 	def transfers_entity_body(conn, header, src, dst, out_io = nil)
 		content_length = header["Content-Length"].to_i
 		transferred_bytes = 0
-		if content_length > 0 then
-			if out_io.nil? then
-				transferred_bytes = IO.copy_stream(src, dst, content_length)
+		if content_length > 0
+			if out_io.nil?
+				transferred_bytes = IO.copy_stream src, dst, content_length
 			else
-				transferred_bytes = IO.copy_stream(src, out_io, content_length)
+				transferred_bytes = IO.copy_stream src, out_io, content_length
 				out_io.rewind
-				transferred_bytes = IO.copy_stream(out_io, dst, transferred_bytes)
+				transferred_bytes = IO.copy_stream out_io, dst, transferred_bytes
 			end
 		else
 			transfer_encoding = header["Transfer-Encoding"]
-			if transfer_encoding == 'chunked' then
+			if transfer_encoding == 'chunked'
 				chunk = nil
 				chunk = StringIO.new unless out_io.nil?
 				loop do
 					len = src.gets
-					dst.write(len)
+					dst.write len
 					len = len.hex
 					break if len == 0
 
 					copied_bytes = 0
-					if chunk.nil? then
-						copied_bytes = IO.copy_stream(src, dst, len)
+					if chunk.nil?
+						copied_bytes = IO.copy_stream src, dst, len
 					else
 						chunk.rewind
-						copied_bytes = IO.copy_stream(src, chunk, len)
+						copied_bytes = IO.copy_stream src, chunk, len
 						chunk.rewind
-						copied_bytes = IO.copy_stream(chunk, dst, copied_bytes)
+						copied_bytes = IO.copy_stream chunk, dst, copied_bytes
 					end
-					@logger.debug("#{conn} >> Transferred chunk size: #{copied_bytes} bytes")
+					@logger.debug "#{conn} >> Transferred chunk size: #{copied_bytes} bytes"
 
-					dst.write(src.gets)
+					dst.write src.gets
 					dst.flush
 
-					unless chunk.nil? then
+					unless chunk.nil?
 						chunk.rewind
-						IO.copy_stream(chunk, out_io, copied_bytes)
+						IO.copy_stream chunk, out_io, copied_bytes
 					end
 					transferred_bytes += copied_bytes
 				end
 				dst.flush
-				dst.write(src.gets)
+				dst.write src.gets
 				dst.flush
-			elsif transfer_encoding.nil? == false then
+			elsif transfer_encoding.nil? == false
 				raise "Unknown Transfer-Encoding: #{transfer_encoding}"
 			end
 		end
 		out_io.rewind unless out_io.nil?
-		@logger.debug("#{conn} >> Transferred total size: #{transferred_bytes} bytes")
-		return transferred_bytes
+		@logger.debug "#{conn} >> Transferred total size: #{transferred_bytes} bytes"
+		transferred_bytes
 	end
 
 	#
-	# Receive HTTP request header from the client side.
+	# Receive HTTP request header from downstream.
 	#
 	def receive_request_header(from, sock)
 		return nil if sock.nil? or sock.eof?
 		start_line = sock.gets
 		raise "Unable to receive request header." if start_line.nil?
 
-		m = start_line.strip!.match(/^(?<method>[A-Z]+) (?<path>[^ ]+) (?<http_version>HTTP\/1\.[01])$/)
+		m = start_line.strip!.match /^(?<method>[A-Z]+) (?<path>[^ ]+) (?<http_version>HTTP\/1\.[01])$/
 		raise "Unsupported HTTP request start line: #{start_line}" if m.nil?
 		method = m[:method]
 		path = m[:path]
@@ -130,34 +138,34 @@ class SimpleTProxy
 		protocol = 'http'
 		host = nil
 		port = 80
-		if method == 'CONNECT' then
+		if method == 'CONNECT'
 			w = path.split(':')
 			host = w[0]
 			port = w[1].to_i
 			protocol = 'https' if port == 443
-		elsif path[0] != '/' then
+		elsif path[0] != '/'
 			uri = URI.parse(path)
 			protocol = uri.scheme
 			host = uri.host
 			port = uri.port
 			path = uri.path
 		end
-		@logger.debug("#{from} >> #{method} #{path} #{http_version}")
+		@logger.debug "#{from} >> #{method} #{path} #{http_version}"
 
-		header = parse_header(sock)
-		@logger.debug("#{from} >> " + header.to_s)
+		header = parse_header sock
+		@logger.debug "#{from} >> #{header.to_s}"
 
 		host = header["Host"] if host.nil?
 		raise "No Host header." if host.nil?
 
 		keep_alive = http_version == 'HTTP/1.1'
 		keep_alive = false if header['Connection'] == 'Close'
-		if keep_alive and header['Keep-Alive'].kind_of?(String) then
+		if keep_alive && header['Keep-Alive'].kind_of?(String)
 			max = header['Keep-Alive'].match(/max=([0-9]+)/).to_a[1].to_i
 			keep_alive = false if max == 0
 		end
 
-		return {
+		{
 			:method => method,
 			:path => path,
 			:http_version => http_version,
@@ -165,19 +173,20 @@ class SimpleTProxy
 			:host => host,
 			:keep_alive => keep_alive,
 			:protocol => protocol,
-			:port => port
+			:port => port,
+			:body => nil
 		}
 	end
 
 	#
-	# Send HTTP request header to the server side.
+	# Send HTTP request header to upstream.
 	#
 	def send_request_header(request, sock)
 		req = "#{request[:method]} #{request[:path]} #{request[:http_version]}\r\n"
 		request[:header].each {|k, v| req += "#{k}: #{v}\r\n"}
 		req += "\r\n"
 
-		sock.write(req)
+		sock.write req
 		sock.flush
 	end
 
@@ -185,56 +194,72 @@ class SimpleTProxy
 	# Forwarding HTTP request.
 	#
 	def forward_http_request(conn)
-		request = receive_request_header(conn.from, conn.s_sock)
+		request = receive_request_header conn.from, conn.s_sock
 		return nil if request.nil?
 
-		conn.open_host(request[:host], request[:port])
-		if request[:method] != 'CONNECT' then
-			send_request_header(request, conn.d_sock)
+		content_handler = search_handler request[:host], request[:path]
+		request[:body] = StringIO.new unless content_handler.nil?
 
-			conn.snooping_body = @is_snooping_body_handler.call(request)
-
-			entity_body = conn.snooping_body ? StringIO.new : nil
-			transfers_entity_body(conn.from, request[:header], conn.s_sock, conn.d_sock, entity_body)
-			request[:body] = entity_body
+		conn.open_host request[:host], request[:port]
+		if request[:method] != 'CONNECT'
+			send_request_header request, conn.d_sock
+			transfers_entity_body conn.from, request[:header], conn.s_sock, conn.d_sock, request[:body]
 		end
-		return request
+
+		[request, content_handler]
+	end
+
+	#
+	# Receive HTTP response headers from upstream.
+	#
+	def receive_response_header(conn)
+		raise "Disconnected from the remote host." if conn.d_sock.nil? or conn.d_sock.eof?
+		start_line = conn.d_sock.gets
+		raise "Unable to receive response header." if start_line.nil?
+
+		m = start_line.strip!.match /^(?<http_version>HTTP\/1\.[01]) (?<status_code>[0-9]{3}) (?<reason>.+)$/
+		raise "Unsupported HTTP response start line: #{start_line}" if m.nil?
+		http_version = m[:http_version]
+		status_code = m[:status_code]
+		reason = m[:reason]
+		@logger.debug "#{conn} >> #{http_version} #{status_code} #{reason}"
+
+		header = parse_header(conn.d_sock)
+		@logger.debug "#{conn} >> #{header.to_s}"
+
+		{
+			:http_version => http_version,
+			:status_code => status_code,
+			:reason => reason,
+			:header => header,
+			:body => nil
+		}
+	end
+
+	#
+	# Send HTTP response header to downstream.
+	#
+	def send_response_header(response, sock)
+		res = "#{response[:http_version]} #{response[:status_code]} #{response[:reason]}\r\n"
+		response[:header].each {|k, v| res += "#{k}: #{v}\r\n"}
+		res += "\r\n"
+		
+		sock.write res
+		sock.flush
 	end
 
 	#
 	# Forwarding and parsing HTTP responses.
 	#
-	def forward_http_response(conn)
-		raise "Disconnected from the remote host." if conn.d_sock.nil? or conn.d_sock.eof?
-		start_line = conn.d_sock.gets
-		raise "Unable to receive response header." if start_line.nil?
+	def forward_http_response(conn, snoop = false)
+		response = receive_response_header conn
 
-		m = start_line.strip!.match(/^(?<http_version>HTTP\/1\.[01]) (?<status_code>[0-9]{3}) (?<reason>.+)$/)
-		raise "Unsupported HTTP response start line: #{start_line}" if m.nil?
-		http_version = m[:http_version]
-		status_code = m[:status_code]
-		reason = m[:reason]
-		@logger.debug("#{conn} >> #{http_version} #{status_code} #{reason}")
+		response[:body] = StringIO.new if snoop
+		
+		send_response_header response, conn.s_sock
+		transfers_entity_body conn, response[:header], conn.d_sock, conn.s_sock, response[:body]
 
-		header = parse_header(conn.d_sock)
-		@logger.debug("#{conn} >> " + header.to_s)
-
-		res = start_line + "\r\n"
-		header.each {|k, v| res += "#{k}: #{v}\r\n"}
-		res += "\r\n"
-		conn.s_sock.write(res)
-		conn.s_sock.flush
-
-		entity_body = conn.snooping_body ? StringIO.new : nil
-		transfers_entity_body(conn, header, conn.d_sock, conn.s_sock, entity_body)
-
-		return {
-			:http_version => http_version,
-			:status_code => status_code,
-			:reason => reason,
-			:header => header,
-			:body => entity_body
-		}
+		response
 	end
 
 	#
@@ -248,78 +273,30 @@ class SimpleTProxy
 			:header => {},
 			:body => nil
 		}
-		conn.s_sock.write("#{response[:http_version]} #{response[:status_code]} #{response[:reason]}\r\n\r\n")
+		conn.s_sock.write "#{response[:http_version]} #{response[:status_code]} #{response[:reason]}\r\n\r\n"
 		conn.s_sock.flush
 		conn.protocol_handler = method(:https_handler)
-		return response
-	end
-
-	#
-	# When returning true, snooping the body of the request/response.
-	# If you want content_handler to handle content_body, return true here.
-	# *This is a sample of `is_snooping_body_handler`.*
-	#
-	def default_snooping_body?(request)
-		# For example, if you want to get the content_body only when the host is www.example.com:
-		# return request[:host] == 'www.example.com'
-		return true
-	end
-
-	#
-	# Output the response body to a file.
-	# If you want to handle content_body, is_snooping_body_handler must return true.
-	# *This is a sample of `content_hander`.*
-	#
-	def default_content_handler(connect, request, response)
-		type = response[:header]['Content-Type']
-		return if type.nil?
-		return if type != 'binary/octet-stream' and type[0, 12] != 'application/' and type[0, 6] != 'image/'
-
-		body = response[:body]
-		return if body.nil? or body.length == 0
-
-		Thread.new do
-			begin
-				host = request[:host]
-				port = request[:port]
-				path = request[:path]
-
-				pos = path.index('?')
-				path = path[0, pos] unless pos.nil?
-				fpath = "#{host}/#{port}/#{path}"
-
-				FileUtils.mkdir_p(File.dirname(fpath))
-				open(fpath, 'wb') do |ofile|
-					content_encoding = response[:header]['Content-Encoding']
-					if content_encoding == 'gzip' then
-						ofile.syswrite(Zlib::Inflate.new(Zlib::MAX_WBITS + 32).inflate(body.string))
-					else
-						IO.copy_stream(body, ofile)
-					end
-				end
-				@logger.info("#{connect} >> Output: #{fpath}")
-			rescue => e
-				@logger.error("#{connect} >>\n" + e.full_message)
-			end
-		end
+		response
 	end
 
 	#
 	# Handling HTTP sessions
 	#
 	def http_handler(conn)
-		request = forward_http_request(conn)
+		request, content_handler = forward_http_request(conn)
 		return false if request.nil?
 
-		if request[:method] == 'CONNECT' then
-			response = proxy_response_to_CONNECT(conn)
+		if request[:method] == 'CONNECT'
+			response = proxy_response_to_CONNECT conn
+		elsif content_handler.nil?
+			response = forward_http_response conn
 		else
-			response = forward_http_response(conn)
-			@content_handler.call(conn, request, response)
+			response = forward_http_response conn, true
+			content_handler.handler.call conn, request, response
 		end
 
-		@logger.info("#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]} => #{response[:http_version]} #{response[:status_code]} #{response[:reason]}")
-		return request[:keep_alive]
+		@logger.info "#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]} => #{response[:http_version]} #{response[:status_code]} #{response[:reason]}"
+		request[:keep_alive]
 	end
 
 	#
@@ -338,25 +315,25 @@ class SimpleTProxy
 		def content_type_n; @content_type; end
 		def content_type
 			case @content_type
-			when 20 then return 'ChangeCipherSpec'
-			when 21 then return 'Alert'
-			when 22 then return 'Handshake'
-			when 23 then return 'Application Data'
+			when 20; return 'ChangeCipherSpec'
+			when 21; return 'Alert'
+			when 22; return 'Handshake'
+			when 23; return 'Application Data'
 			end
-			return "Unknown type:#{@content_type}"
+			"Unknown type:#{@content_type}"
 		end
 
 		def version
 			v = @version.unpack('n')[0]
 			case v
-			when 0x0200 then return 'SSL 2.0'
-			when 0x0300 then return 'SSL 3.0'
-			when 0x0301 then return 'TLS 1.0'
-			when 0x0302 then return 'TLS 1.1'
-			when 0x0303 then return 'TLS 1.2'
-			when 0x0304 then return 'TLS 1.3'
+			when 0x0200; return 'SSL 2.0'
+			when 0x0300; return 'SSL 3.0'
+			when 0x0301; return 'TLS 1.0'
+			when 0x0302; return 'TLS 1.1'
+			when 0x0303; return 'TLS 1.2'
+			when 0x0304; return 'TLS 1.3'
 			end
-			return "Unknown version:#{v}"
+			"Unknown version:#{v}"
 		end
 
 		def length; @length.unpack('n')[0]; end
@@ -391,15 +368,15 @@ class SimpleTProxy
 		while !payload.eof?
 			extension_type = payload.read(2).unpack('n')[0]
 			extension_length = payload.read(2).unpack('n')[0]
-			if extension_type == ExtensionType::ServerNameIndication then
+			if extension_type == ExtensionType::ServerNameIndication
 				server_name_list_length = payload.read(2).unpack('n')[0]
 				server_name_type = payload.readbyte
 				server_name_length = payload.read(2).unpack('n')[0]
 				server_name = payload.read(server_name_length)
-				conn.open_host(server_name, 443)
+				conn.open_host server_name, 443
 				conn.d_sock.write(packet)
 				conn.d_sock.flush
-				@logger.info("#{conn} >> Connection #{packet.version}")
+				@logger.info "#{conn} >> Connection #{packet.version}"
 				break
 			else
 				payload.read(extension_length)
@@ -412,22 +389,20 @@ class SimpleTProxy
 	# Handling HTTPS sessions
 	#
 	def https_handler(conn)
-		if conn.d_sock.nil? then
-			open_host_by_SNI(conn)
-		end
+		open_host_by_SNI(conn) if conn.d_sock.nil?
 
-		xsock = IO.select([conn.s_sock, conn.d_sock], [], [], 300)
+		xsock = IO.select [conn.s_sock, conn.d_sock], [], [], 300
 		return false if xsock.nil? or xsock.length == 0
 		for s in xsock[0]
 			if s == conn.s_sock
-				forward_tls_packet(conn, conn.s_sock, conn.d_sock)
+				forward_tls_packet conn, conn.s_sock, conn.d_sock
 			elsif s == conn.d_sock
-				forward_tls_packet(conn, conn.d_sock, conn.s_sock)
+				forward_tls_packet conn, conn.d_sock, conn.s_sock
 			else
 				raise TLSError.new("Unknown socket: #{s.addr} <=> #{s.peeraddr}")
 			end
 		end
-		return true
+		true
 	end
 
 	#
@@ -435,8 +410,8 @@ class SimpleTProxy
 	# 
 	def forward_tls_packet(conn, s_sock, d_sock)
 		packet = TLSPacket.new(s_sock)
-		@logger.debug("#{conn} >> #{packet.inspect}")
-		d_sock.write(packet)
+		@logger.debug "#{conn} >> #{packet.inspect}"
+		d_sock.write packet
 		d_sock.flush
 	end
 	
@@ -448,7 +423,7 @@ class SimpleTProxy
 			from = "#{s_sock.peeraddr[2]}:#{s_sock.peeraddr[1]}"
 			request = {}
 			begin
-				request = receive_request_header(from, s_sock)
+				request = receive_request_header from, s_sock
 				raise 'failed parse.' if request.nil?
 				raise 'unsupport method.' unless request[:method] == 'GET'
 				raise 'unknown path.' unless request[:path] == '/status'
@@ -457,11 +432,11 @@ class SimpleTProxy
 				@mutex.synchronize {@connections.each {|k, v| body.push(v.status)}}
 
 				body_s = "[#{body.join(',')}]"
-				s_sock.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: #{body_s.length}\r\nConnection: close\r\n\r\n#{body_s}" )
-				@logger.info("#{from} >> #{request[:method]} #{request[:path]} #{request[:http_version]}: Success")
+				s_sock.write "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: #{body_s.length}\r\nConnection: close\r\n\r\n#{body_s}"
+				@logger.info "#{from} >> #{request[:method]} #{request[:path]} #{request[:http_version]}: Success"
 			rescue => e
-				s_sock.write('HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n')
-				@logger.info("#{from} >> #{request[:method]} #{request[:path]} #{request[:http_version]}: #{e.full_message}")
+				s_sock.write 'HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n'
+				@logger.info "#{from} >> #{request[:method]} #{request[:path]} #{request[:http_version]}: #{e.full_message}"
 			ensure
 				s_sock.flush
 				s_sock.close
@@ -475,7 +450,6 @@ class SimpleTProxy
 	class Connection
 		attr_reader :s_sock, :d_sock, :from, :to, :update_time
 		attr_writer :protocol_handler
-		attr_accessor :snooping_body
 	
 		def initialize(s_sock, protocol_handler, &block)
 			@s_sock = s_sock
@@ -484,7 +458,6 @@ class SimpleTProxy
 			@to = "*No connect*"
 			@close = true
 			@protocol_handler = protocol_handler
-			@snooping_body = false
 			@update_time = Time.now
 			block.call(self) if block_given?
 		end
@@ -507,7 +480,7 @@ class SimpleTProxy
 			return false if @close
 			dead = @s_sock.closed? || @d_sock.closed?
 			close if dead
-			return !dead
+			!dead
 		end
 
 		def session; @protocol_handler.call(self); end
@@ -529,17 +502,17 @@ class SimpleTProxy
 						break if IO.select([conn.s_sock, conn.d_sock], [], [], 300).length == 0
 					end
 				rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, TLSError => e
-					@logger.error("#{conn} >> #{e.message}")
+					@logger.error "#{conn} >> #{e.message}"
 				rescue EOFError, Errno::ECONNRESET => e
-					@logger.error("#{conn} >> #{e.inspect} #{e.backtrace[0]}")
+					@logger.error "#{conn} >> #{e.inspect} #{e.backtrace[0]}"
 				rescue => e
-					@logger.error("#{conn} >>\n" + e.full_message)
+					@logger.error "#{conn} >>\n" + e.full_message
 				ensure
 					conn.close
 				end
 				@mutex.synchronize {
-					@connections.delete(conn.from)
-					@logger.info("#{conn} >> disconnection: #{@connections.length} remains.")
+					@connections.delete conn.from
+					@logger.info "#{conn} >> disconnection: #{@connections.length} remains."
 				}
 			end
 		end
@@ -548,10 +521,10 @@ class SimpleTProxy
 	#
 	# Start proxy server
 	#
-	def start
-		@http_sock = TCPServer.open(@bind_address, @http_port) if @http_port > 0
-		@https_sock = TCPServer.open(@bind_address, @https_port) if @https_port > 0
-		@command_sock = TCPServer.open(@bind_address, @command_port) if @command_port > 0
+	def start(bind_address: nil, http_port: 8080, https_port: 8443, command_port: 0)
+		@http_sock = TCPServer.open(bind_address, http_port) if http_port > 0
+		@https_sock = TCPServer.open(bind_address, https_port) if https_port > 0
+		@command_sock = TCPServer.open(bind_address, command_port) if command_port > 0
 		ports = []
 		ports.push(@http_sock) unless @http_sock.nil?
 		ports.push(@https_sock) unless @https_sock.nil?
@@ -564,8 +537,8 @@ class SimpleTProxy
 
 		begin
 			loop do
-				xsock = IO.select(ports, [], [], 60)
-				if xsock.nil? then
+				xsock = IO.select ports, [], [], 60
+				if xsock.nil?
 					@mutex.synchronize {
 						prev_conn = @connections.length
 						@connections.delete_if {|k, v| !v.alive?}
@@ -575,14 +548,14 @@ class SimpleTProxy
 					next
 				end
 				for s in xsock[0]
-					if !@http_sock.nil? and s == @http_sock then add_new_connection(s.accept, method(:http_handler))
-					elsif !@https_sock.nil? and s == @https_sock then add_new_connection(s.accept, method(:https_handler))
-					elsif !@command_sock.nil? and s == @command_sock then command_handler(s.accept)
+					if !@http_sock.nil? and s == @http_sock; add_new_connection(s.accept, method(:http_handler))
+					elsif !@https_sock.nil? and s == @https_sock; add_new_connection(s.accept, method(:https_handler))
+					elsif !@command_sock.nil? and s == @command_sock; command_handler(s.accept)
 					else raise "Unknown socket: #{s.addr}" end
 				end
 			end
-		rescue => e
-			@logger.error(e.full_message)
+		rescue
+			@logger.error $!
 		ensure
 			stop
 		end
