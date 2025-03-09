@@ -186,8 +186,12 @@ class SimpleTProxy
 		request[:header].each {|k, v| req += "#{k}: #{v}\r\n"}
 		req += "\r\n"
 
+		raise req if sock.closed?
+
 		sock.write req
 		sock.flush
+	rescue
+		raise req
 	end
 
 	#
@@ -207,6 +211,9 @@ class SimpleTProxy
 		end
 
 		[request, content_handler]
+	rescue
+		@logger.error "#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]}"
+		raise $!.message 
 	end
 
 	#
@@ -243,9 +250,13 @@ class SimpleTProxy
 		res = "#{response[:http_version]} #{response[:status_code]} #{response[:reason]}\r\n"
 		response[:header].each {|k, v| res += "#{k}: #{v}\r\n"}
 		res += "\r\n"
-		
+
+		raise res if sock.closed?
+
 		sock.write res
 		sock.flush
+	rescue
+		raise res
 	end
 
 	#
@@ -297,6 +308,9 @@ class SimpleTProxy
 
 		@logger.info "#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]} => #{response[:http_version]} #{response[:status_code]} #{response[:reason]}"
 		request[:keep_alive]
+	rescue
+		@logger.error $!
+		return false
 	end
 
 	#
