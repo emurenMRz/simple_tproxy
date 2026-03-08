@@ -9,7 +9,7 @@ begin
 	@server_log.progname = 'tproxy'
 	@server_log.level = Logger::Severity::INFO
 
-	proxy = SimpleTProxy.new logger: @server_log
+	proxy = SimpleTProxy.new logger: @server_log, log_all: true
 
 	Signal.trap(:INT) { proxy.stop; puts 'The server is stopped by an interrupt.'; exit }
 	Signal.trap(:TERM) { proxy.stop; exit }

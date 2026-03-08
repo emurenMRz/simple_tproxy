@@ -14,8 +14,10 @@ module ExtensionType
 end
 
 class SimpleTProxy
-	def initialize(logger: Logger.new(STDOUT))
+	def initialize(logger: Logger.new(STDOUT), log_all: false, log_filter: nil)
 		@logger = logger
+		@log_all = log_all
+		@log_filter = log_filter
 
 		@content_handler = []
 		@http_sock = nil
@@ -210,10 +212,19 @@ class SimpleTProxy
 			transfers_entity_body conn.from, request[:header], conn.s_sock, conn.d_sock, request[:body]
 		end
 
+		log_request(request)
+
 		[request, content_handler]
 	rescue
 		@logger.error "#{conn} >> #{request[:method]} #{request[:path]} #{request[:http_version]}"
 		raise $!.message 
+	end
+
+	def log_request(request)
+		return unless @log_all || (@log_filter && @log_filter.call(request))
+		@logger.info "Request: #{request[:method]} #{request[:path]} #{request[:http_version]}"
+		@logger.info "Headers: #{request[:header]}"
+		@logger.info "Body: #{request[:body].string}" if request[:body]
 	end
 
 	#
@@ -270,7 +281,16 @@ class SimpleTProxy
 		send_response_header response, conn.s_sock
 		transfers_entity_body conn, response[:header], conn.d_sock, conn.s_sock, response[:body]
 
+		log_response(response)
+
 		response
+	end
+
+	def log_response(response)
+		return unless @log_all || (@log_filter && @log_filter.call(response))
+		@logger.info "Response: #{response[:http_version]} #{response[:status_code]} #{response[:reason]}"
+		@logger.info "Headers: #{response[:header]}"
+		@logger.info "Body: #{response[:body].string}" if response[:body]
 	end
 
 	#
